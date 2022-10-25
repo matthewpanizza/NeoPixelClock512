@@ -22,3 +22,7 @@ A program built for Particle devices for making a digital clock with live weathe
 - encode8Cond(), encode32Cond(), encode64Cond(): Display 8, 32 or 64 bit bitmaps on the software array. Used by letter(), num(), snum().
 - displayCondition(): Display a weather condition on the software array
 - displayClock(): Display clock digits with a colon on the software array
+
+## Hardware
+
+![camphoto_1903590565](https://user-images.githubusercontent.com/47908040/197674560-9b2158cd-e7f3-4df2-919e-96371da0c4d3.JPG)
