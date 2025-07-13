@@ -47,9 +47,12 @@ SYSTEM_THREAD(ENABLED);
 
 #define brtsns A4               //Define Photoresistor pin (use 10k pulldown resistor)
 
+#define KEY_CODE 250            //Code stored in the first location of the eeprom to check if a first-time write is needed for a new MCU
+
 ////////////////////////////////////
 //////// EEPROM ADDRESSES //////////
 ////////////////////////////////////
+// EEPROM 0: Program Key Code    ///
 // EEPROM 1: Time zone offset    ///
 // EEPROM 2: Weather Data toggle ///
 // EEPROM 3: CO2 Data toggle     ///
@@ -118,12 +121,16 @@ void setup() {
     for(j=0; j < 256; j++){     //Erase top half of screen where startup animations were
         screenArray[j] = 0;
     }
-    EEPROM.write(1,16);     //Manual setting of EEPROMs
-    EEPROM.write(2,1);
-    EEPROM.write(3,0);
-    EEPROM.write(4,0);
-    EEPROM.write(5,1);
-    EEPROM.write(6,0);
+    uint8_t keyCode = EEPROM.read(0);   //Load the first EEPROM location which has the key code corresponding to this program (Allows swapping of MCUs)
+    if(keyCode != KEY_CODE){
+        EEPROM.write(0,KEY_CODE);
+        EEPROM.write(1,17);     //Manual setting of EEPROMs
+        EEPROM.write(2,1);
+        EEPROM.write(3,0);
+        EEPROM.write(4,0);
+        EEPROM.write(5,1);
+        EEPROM.write(6,0);
+    }
     Particle.variable("Photo", photo);      //Open up ambient light sensor variable for cloud reads
     Particle.subscribe("hook-response/Weather", weatherHandler, MY_DEVICES);             //Subscribes to Weather API event
     Time.zone(12-EEPROM.read(1));
@@ -132,8 +139,6 @@ void setup() {
     bound = dnbound;
     delay(50);
     checkForUpdate(true);
-
-
 }
 
 //Functions to convert an encoded color value to a 0-255 individual color (R, G, or B)
@@ -197,7 +202,7 @@ uint32_t snum(int val) {//Code block for displaying smaller 3x5 numbers, pix arg
 // 4 12 20  
 // 
 // 
-if(val > 9 || val < 0) return;    //Don't overflow the array
+if(val > 9 || val < 0) return 0;    //Don't overflow the array
 uint32_t numArray[10] = { 2035999, 2031616, 1512733, 2037013, 2032647, 1905943, 1905951, 2031873, 2037023, 2037015};
 return numArray[val];
 
@@ -214,7 +219,7 @@ uint32_t num(int val) {       //Code block for displaying larger 4x7 numbers, pi
 // 4 12 20  28
 // 5 13 21  29
 // 6 14 22  30
-if(val > 9 || val < 0) return;    //Don't overflow the array
+if(val > 9 || val < 0) return 0;    //Don't overflow the array
 uint32_t numArray[10] = {2134983039, 2130706432, 1330203001, 2135509321, 2131232783,2034846031, 2034846079, 2130772225, 2135509375, 2135509327};
 return numArray[val];
 
@@ -596,20 +601,19 @@ void displayClock(int inpix, uint8_t R, uint8_t G, uint8_t B, int manctrl){
             displayNumber(hr-(10*(hr/10)),inpix+16,R,G,B,false);        //Display other digit of hour
         }
         else{                                               //Display small clock if set in EEPROM
-            /*mprev = Time.minute();
-            if(min/10 == 0) {
-                snum(0,63+inpix,R,G,B);
-                snum(min,95+inpix,R,G,B);
+            mprev = Time.minute();                          //Save current time for next check
+            screenArray[inpix+49] = (B/2)+(1000*(G/2))+(1000000*(R/2));                        //Display clock colons
+            screenArray[inpix+51] = (B/2)+(1000*(G/2))+(1000000*(R/2));
+            if(min/10 == 0) {                               //Check if minute number is less than 10
+                displayNumber(0,64+inpix,R,G,B,true);            //Display 0 digit if less than 10 in 10's place
+                displayNumber(min,96+inpix,R,G,B,true);
             }
             else {
-                snum((min/10),63+inpix,R,G,B);
-                snum((min%10),95+inpix,R,G,B);
+                displayNumber((min/10),64+inpix,R,G,B,true);
+                displayNumber((min%10),96+inpix,R,G,B,true);
             }
-            for(i=0+inpix;i<5+inpix;i++)
-            {
-                strip.setPixelColor(i,R*(hr/10),G*(hr/10),B*(hr/10));
-            }
-            snum(hr-(10*(hr/10)),16+inpix,R,G,B);*/
+            displayNumber(1,inpix-16,R*(hr/10),G*(hr/10),B*(hr/10),true);   //Display 1 if present in the hour
+            displayNumber(hr-(10*(hr/10)),inpix+16,R,G,B,true);        //Display other digit of hour
         }
     }
 } 
@@ -1034,7 +1038,7 @@ void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B){
     }
 }
 void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                                        //Code block for a settings menu, once initiated, it waits for the user to press the up (D0) and down (D2) to exit                                                              
-    #define numMenuItems 5
+    #define numMenuItems 6
     bool sett = true;
     int smode = 1;
     fillStrip(inpix,inpix+255,0,0,0,true);
@@ -1058,6 +1062,9 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 strDisp("About", inpix, R, G, B, false);
                 break;
             case 5:
+                strDisp("Tzone", inpix, R, G, B, false);
+                break;
+            case 6:
                 strDisp("Exit", inpix, R, G, B, false);
                 if(digitalRead(enbtn) == HIGH){
                     sett = false;
@@ -1081,6 +1088,7 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
         if(digitalRead(enbtn) == HIGH){
             bool submenu = true;
             int submode = 1;
+            int tzoff = EEPROM.read(1);
             while(digitalRead(enbtn) == HIGH) delay(5);
             fillStrip(inpix,inpix+255,0,0,0,true);
             while(submenu){
@@ -1090,12 +1098,17 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                             case 1:
                                 strDisp("sig str", inpix, R, G, B, false);
                                 if(digitalRead(enbtn) == HIGH){
-                                    //WiFiSignal sig = WiFi.RSSI();
-                                    //uint8_t strength = uint8_t(sig.getStrength());
+                                    #if PLATFORM_ID == PLATFORM_ARGON
+                                        WiFiSignal sig = WiFi.RSSI();
+                                        uint8_t strength = uint8_t(sig.getStrength());
+                                    #elif PLATFORM_ID == PLATFORM_BORON
+                                        CellularSignal sig = Cellular.RSSI();
+                                        uint8_t strength = sig.getStrength();     
+                                    #endif
                                     fillStrip(inpix,inpix+255,0,0,0,true);
-                                    //displayNumber(strength/100,inpix,R,G,B,true);
-                                    //displayNumber((strength/10)%10,inpix+48,R,G,B,true);
-                                    //displayNumber(strength%10,inpix+96,R,G,B,true);
+                                    displayNumber(strength/100,inpix,R,G,B,true);
+                                    displayNumber((strength/10)%10,inpix+48,R,G,B,true);
+                                    displayNumber(strength%10,inpix+96,R,G,B,true);
                                     printScreen(screenArray,inpix,inpix+255);
                                     while(digitalRead(enbtn) == HIGH) delay(5);
                                     while(digitalRead(enbtn) == LOW) delay(5);
@@ -1170,9 +1183,30 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         }
                         if(menuButtonUpdate(&submode,4)) fillStrip(inpix,inpix+255,0,0,0,true);
                         break;
-                    case 5:     //Dark Sub-menu
+                    case 5:
+                        while(digitalRead(enbtn)) delay(5);
+                        while(!digitalRead(enbtn)){
+                            displayClock(0, 0, gclock, 0, true);
+                            printScreen(screenArray,0,255);
+                            if(menuButtonUpdate(&tzoff,23)){
+                                char tnum[3] = "";
+                                sprintf(tnum,"%d", tzoff);
+                                strDisp(tnum,inpix,rclock,gclock,bclock,true);
+                                Time.zone(12-tzoff);
+                                Particle.syncTime();
+                            }
+                            delay(5);
+                        }
+                        EEPROM.write(1, tzoff);
+                        while(digitalRead(enbtn)) delay(5);
+                        submenu = false;
+                        break;
+                    case 6:
                         strDisp("Exit", inpix, R, G, B, false);
-                        if(digitalRead(enbtn) == HIGH) submenu = false;
+                        if(digitalRead(enbtn) == HIGH){
+                            submenu = false;
+                            while(digitalRead(enbtn) == HIGH) delay(5);
+                        }
                         break;
                 }
                 printScreen(screenArray,inpix,inpix+255);

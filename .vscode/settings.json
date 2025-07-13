@@ -7,7 +7,6 @@
         "random": "cpp",
         "algorithm": "cpp"
     },
-    "particle.firmwareVersion": "3.1.0",
-    "particle.targetPlatform": "photon",
-    "particle.targetDevice": "bobcat_mighty"
+    "particle.firmwareVersion": "1.5.2",
+    "particle.targetPlatform": "boron"
 }
