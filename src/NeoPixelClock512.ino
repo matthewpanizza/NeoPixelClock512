@@ -17,6 +17,14 @@
 
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(PIXEL_COUNT, PIXEL_PIN, PIXEL_TYPE);    //Initialize neopixel function
 
+////////////////////////////////////
+////// ITEM LOCATION CONFIG ////////
+////////////////////////////////////
+
+
+#define ITEMP_INPIX     265
+
+#define IHUMID_INPIX    353
 
 ////////////////////////////////////
 /////// NIGHT MODE CONFIG //////////
@@ -50,15 +58,29 @@ SYSTEM_THREAD(ENABLED);
 #define KEY_CODE 250            //Code stored in the first location of the eeprom to check if a first-time write is needed for a new MCU
 
 ////////////////////////////////////
+//// BLUETOOTH CONFIGURATION ///////
+////////////////////////////////////
+
+const char* serviceUuid     = "b4200480-fb4b-4746-b2b0-93f0e61122c6";   //Main BLE service to advertise
+const char* contTXUuid     = "b4200481-fb4b-4746-b2b0-93f0e61122c6";     //Characteristic to send a CAN message over BLE
+const char* contRXUuid     = "b4200482-fb4b-4746-b2b0-93f0e61122c6";     //Characteristic to send a CAN message over BLE
+
+BleUuid NeoClockService(serviceUuid);
+BleCharacteristic controlTXCharacteristic  ("contTX", BleCharacteristicProperty::NOTIFY, contTXUuid, NeoClockService); 
+BleCharacteristic controlRXCharacteristic  ("contRX", BleCharacteristicProperty::WRITE_WO_RSP, contRXUuid, NeoClockService, controlDataReceived, (void*)contRXUuid); 
+
+BleAdvertisingData advData;                     //Advertising data
+
+////////////////////////////////////
 //////// EEPROM ADDRESSES //////////
 ////////////////////////////////////
-// EEPROM 0: Program Key Code    ///
 // EEPROM 1: Time zone offset    ///
 // EEPROM 2: Weather Data toggle ///
 // EEPROM 3: CO2 Data toggle     ///
 // EEPROM 4: Indoor temp toggle  ///
 // EEPROM 5: Dark Mode Color     ///
 // EEPROM 6: Mini Clock          ///
+// EEPROM 7: True Tone           ///
 ////////////////////////////////////
 
 
@@ -82,30 +104,38 @@ int dmode;      //Flag for choosing display mode, 1 is condition cycle, 2 is all
 int cid;        //Global variable for outdoor condition id from weather webhook
 char cltr[1];   //Global variable for outdoor condition mode (day or night from openweather webhook)
 int i, j;       //Global loop variables, since these are used so much, optimize re-declaration of local vars
-int itemp;      //Global for indoor temperature sensor, deprecated
+int itemp,ihumid;      //Global for indoor temperature sensor
 int ico2;       //Global for indoor CO2 sensor, deprecated
 int fdark;      //Flag to erase freezing temperature indicator upon startup
-int screenArray[512];   //Array of pixels in array, with encoded 24-bit color
-uint32_t lastUpdate;    //Timer for requesting data from openweather webhook
+uint32_t screenArray[PIXEL_COUNT];   //Array of pixels in array, with encoded 24-bit color
+uint64_t lastUpdate;    //Timer for requesting data from openweather webhook
 char dowVal[7];         //Stonks webhook string
 bool trueTone;      //Flag to warm up temperature when in lower ambient light
+bool lTrig, rTrig, eTrig;
+bool displayInteral = false;
+
+Timer bleButtonTimer(500,bleClickInt);
 
 //STARTUP(WiFi.selectAntenna(ANT_INTERNAL));
 
 //Function run once on startup to initialize variables
 void setup() {
+    Serial.begin(115200);
     lastUpdate = 0;             //Set lastupdate to 0 so weather is updated soon
-    pinMode(D0, INPUT_PULLDOWN);//Pin Mode setter, these inputs are buttons
-    pinMode(D1, INPUT_PULLDOWN);
-    pinMode(D2, INPUT_PULLDOWN); 
+    pinMode(upbtn, INPUT_PULLDOWN);//Pin Mode setter, these inputs are buttons
+    pinMode(enbtn, INPUT_PULLDOWN);
+    pinMode(dnbtn, INPUT_PULLDOWN); 
     pinMode(D7,OUTPUT);         //Enable output on onboard blue LED
+    attachInterrupt(upbtn, rButtonInt, CHANGE);
+    attachInterrupt(enbtn, eButtonInt, CHANGE);
+    attachInterrupt(dnbtn, lButtonInt, CHANGE);
     RGB.control(true);          //Take control of the onboard RGB LED
     RGB.color(0, 0, 0);         //Turn off onboard LED so it's not on when the room is dark
     scan = 1;                   //scans photoresistor for room brightness
     wmode = 1;                  //Start initially displaying temperature
     dmode = 1;                  //Initially displaying condition cycle mode
     fdark = 2;                  //Turn off freezing outdoor temp indicator
-    trueTone = true;            //Turn on temperature warming by default
+    trueTone = (EEPROM.read(7) == 1);            //Turn on temperature warming by default
     strip.begin();              //Initialize neopixel matrix
     strip.show();
     for(j=0; j < 512; j++){     //Initialize matrix array for display
@@ -130,6 +160,7 @@ void setup() {
         EEPROM.write(4,0);
         EEPROM.write(5,1);
         EEPROM.write(6,0);
+        EEPROM.write(7,1);
     }
     Particle.variable("Photo", photo);      //Open up ambient light sensor variable for cloud reads
     Particle.subscribe("hook-response/Weather", weatherHandler, MY_DEVICES);             //Subscribes to Weather API event
@@ -139,20 +170,27 @@ void setup() {
     bound = dnbound;
     delay(50);
     checkForUpdate(true);
+
+    BLE.addCharacteristic(controlTXCharacteristic);
+    BLE.addCharacteristic(controlRXCharacteristic);
+
+    advData.appendServiceUUID(NeoClockService);    // Add the app service
+    advData.appendLocalName("NeoClock");                 //Local advertising name
+    BLE.advertise(&advData);                        //Start advertising the characteristics
 }
 
 //Functions to convert an encoded color value to a 0-255 individual color (R, G, or B)
-int getRVal(int colorCode){                                                                                         //Filters out Red value from array element
-    return ((colorCode/1000000)%1000);
+uint32_t getRVal(uint32_t colorCode){                                                                                         //Filters out Red value from array element
+    return ((colorCode >> 16) & 255);
 }
-int getGVal(int colorCode){                                                                                         //Filters out Green value from array element
-    return ((colorCode/1000)%1000);
+uint32_t getGVal(uint32_t colorCode){                                                                                         //Filters out Green value from array element
+    return ((colorCode >> 8) & 255);
 }
-int getBVal(int colorCode){                                                                                         //Filters out Blue value from array element
-    return (colorCode%1000);
+uint32_t getBVal(uint32_t colorCode){                                                                                         //Filters out Blue value from array element
+    return (colorCode & 255);
 }
 //Dynamic function for updating neopixel array based on contents of software encoded array, start and stop take pixel ranges so partial sections can be updated
-void printScreen(int inputArray[], int start, int end){
+void printScreen(uint32_t inputArray[], int start, int end){
     uint16_t count;
     for(count = start; count <= end; count++){
         if(!(count>>8)){        //Update pixels for the array between 0 and 255
@@ -189,7 +227,6 @@ void printScreen(int inputArray[], int start, int end){
     }
     strip.show();
 }
-
 //Function to return a pixel bitmap for a small-sized number based on an inputted decimal number like '9' or '5'
 uint32_t snum(int val) {//Code block for displaying smaller 3x5 numbers, pix arg is the top left pixel, num is the number
 
@@ -472,11 +509,12 @@ void strDisp(const char *wrd, int inpix, uint8_t R, uint8_t G, uint8_t B, bool s
     for(loop=0;loop<strlen(wrd);loop++)
     {
         pix = pix+8+(8*letter(wrd[loop],pix,R,G,B,small));
+        if(pix >= PIXEL_COUNT) return;
     }
 }
 //Take an RGB value and convert it to a 9-digit number for storage in the screen array. R is the upper 3 digits, G is the middle 3, and B is the lower 3
-int encodeColor(uint8_t R, uint8_t G, uint8_t B){                       //Encodes RGB 24 bit color into one integer for array storage
-    return B+(1000*G)+(1000000*R);
+uint32_t encodeColor(uint8_t R, uint8_t G, uint8_t B){                       //Encodes RGB 24 bit color into one integer for array storage
+    return B+((uint32_t)G << 8)+((uint32_t)R << 16);
 }
 //Function to draw out a 64-bit bitmap in the software screen array. RGB sets the color, inpix is the top-left pixel of the bitmap, erase erases the pixels in the region between inpix and length
 void encode64Cond(uint64_t enCond, int inpix, int length, uint8_t R, uint8_t G, uint8_t B, bool erase){
@@ -575,7 +613,7 @@ void displayNumber(int val, int inpix, uint8_t R, uint8_t G, uint8_t B, bool sma
     }
     for(i = 0; i < 32; i++){
         if((encNum & 1) == 1 && (i + inpix) >= 0){
-            screenArray[i+inpix] = B+(1000*G)+(1000000*R);
+            screenArray[i+inpix] = B+(G << 8)+(R << 16);
         }
         encNum = encNum >> 1;
     }
@@ -587,8 +625,8 @@ void displayClock(int inpix, uint8_t R, uint8_t G, uint8_t B, int manctrl){
     if(mprev != min || manctrl) {                                      //Check if time has changed from last pixel push
         if(EEPROM.read(6) == 0){                            //If the brightness is above the threshold, post large numbers by default
             mprev = Time.minute();                          //Save current time for next check
-            screenArray[inpix+57] = (B/2)+(1000*(G/2))+(1000000*(R/2));                        //Display clock colons
-            screenArray[inpix+61] = (B/2)+(1000*(G/2))+(1000000*(R/2));
+            screenArray[inpix+57] = (B/2)+((G/2) << 8)+((R/2) << 16);                        //Display clock colons
+            screenArray[inpix+61] = (B/2)+((G/2) << 8)+((R/2) << 16);
             if(min/10 == 0) {                               //Check if minute number is less than 10
                 displayNumber(0,72+inpix,R,G,B,false);            //Display 0 digit if less than 10 in 10's place
                 displayNumber(min,112+inpix,R,G,B,false);
@@ -602,8 +640,8 @@ void displayClock(int inpix, uint8_t R, uint8_t G, uint8_t B, int manctrl){
         }
         else{                                               //Display small clock if set in EEPROM
             mprev = Time.minute();                          //Save current time for next check
-            screenArray[inpix+49] = (B/2)+(1000*(G/2))+(1000000*(R/2));                        //Display clock colons
-            screenArray[inpix+51] = (B/2)+(1000*(G/2))+(1000000*(R/2));
+            screenArray[inpix+49] = (B/2)+((G/2) << 8)+((R/2) << 16);                        //Display clock colons
+            screenArray[inpix+51] = (B/2)+((G/2) << 8)+((R/2) << 16);
             if(min/10 == 0) {                               //Check if minute number is less than 10
                 displayNumber(0,64+inpix,R,G,B,true);            //Display 0 digit if less than 10 in 10's place
                 displayNumber(min,96+inpix,R,G,B,true);
@@ -617,7 +655,6 @@ void displayClock(int inpix, uint8_t R, uint8_t G, uint8_t B, int manctrl){
         }
     }
 } 
-
 //Function for displaying the outdoor temperature, takes the temperature variale, initial pixel, and color
 void displayTemp(int temperature, int inpix, uint8_t R, uint8_t G, uint8_t B, bool small){
     int TC1 = temperature/10;
@@ -633,19 +670,19 @@ void displayTemp(int temperature, int inpix, uint8_t R, uint8_t G, uint8_t B, bo
         screenArray[inpix+80] = encodeColor(R,G,B);
     }
 }
-void displayHumid(int humidPercent, int inpix, uint8_t R, uint8_t G, uint8_t B){
+void displayHumid(int humidPercent, int inpix, uint8_t R, uint8_t G, uint8_t B, bool small){
     int HC1 = humidPercent/10;
     int HC2 = humidPercent%10;
     if(humidPercent == 100){
-        for(HC1 = 0; HC1 < 7; HC1++){
+        for(HC1 = 0; HC1 < (small ? 5:7); HC1++){
             screenArray[inpix+HC1] = encodeColor(R,G,B);
         }
-        displayNumber(0,inpix+16, R, G, B,false);
-        displayNumber(0,inpix+56,R,G,B,false);
+        displayNumber(0,inpix+16, R, G, B,small);
+        displayNumber(0,inpix+(small ? 48:56),R,G,B,small);
     }
     else{
-        displayNumber(HC1,inpix, R, G, B,false);
-        displayNumber(HC2,inpix+40,R,G,B,false);
+        displayNumber(HC1,inpix, R, G, B,small);
+        displayNumber(HC2,inpix+(small ? 32:40),R,G,B,small);
     }
 }
 void dimg(int cnum, int inpix, uint8_t R, uint8_t G, uint8_t B){  //Code block for displaying a still weather animation when in dark mode
@@ -865,7 +902,7 @@ void animateCondition(int cnum, int inpix, int tmr, uint8_t R, uint8_t G, uint8_
     }
 }
 void checkForUpdate(bool manualCtrl){
-    if(lastUpdate+300000 < millis() || lastUpdate > millis() || manualCtrl){
+    if(lastUpdate+300000 < System.millis() || lastUpdate > System.millis() || manualCtrl){
         Particle.publish("Weather", "1", PRIVATE);                                      // Publishes to get weather data
         //Particle.publish("WeatherHL", "1", PRIVATE);
         /*if(EEPROM.read(3) == 1)
@@ -877,7 +914,7 @@ void checkForUpdate(bool manualCtrl){
             Particle.publish("itempdat", "1", PRIVATE);
         }*/
         //Particle.publish("GetStock", "DIA", PRIVATE);
-        lastUpdate = millis();
+        lastUpdate = System.millis();
     }
     /*else if(lastUpdate+15000 < millis() && lastUpdate+30000 > millis()){
         Particle.publish("WeatherHL", "1", PRIVATE);
@@ -887,7 +924,7 @@ void checkForUpdate(bool manualCtrl){
 bool connDelay(int length){
     int count;
     for(count=0; count<(length/100); count++){
-        if(digitalRead(D0)==LOW && digitalRead(D1)==LOW && digitalRead(D2)==LOW){
+        if(!eTrig && !rTrig && !lTrig){
             delay(100);
         }
         else{
@@ -896,18 +933,18 @@ bool connDelay(int length){
     }
     return false;
 }
-bool isSensorDark(){
-    if(analogRead(A4) < bound) {
-        bound = upbound;
-        scan = 1;
-        rclock = 1;
+bool isSensorDark(){    //Function to check if the photoresistor is dark and then update the RGB colors being fed to each of the functions
+    if(analogRead(A4) < bound) {    //Check if less than the bound
+        bound = upbound;            //Adjust bound level for hysterisis
+        scan = 1;                   
+        rclock = 1;                 //Set to red at minimum brightness (default dark color)
         gclock = 0;
         bclock = 0;
-        if(EEPROM.read(5) == 2){
+        if(EEPROM.read(5) == 2){    //If EEPROM is 2, then the background color is minimum green brightness
             gclock = 1;
             rclock = 0;
         }
-        else if(EEPROM.read(5) == 3){
+        else if(EEPROM.read(5) == 3){   //If EEPROM is 3, then the background colod is minimum blue brightness
             bclock = 1;
             rclock = 0;
         }
@@ -916,7 +953,7 @@ bool isSensorDark(){
     }
     return false;
 }
-void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B){
+void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B, bool fadeInternal){
     if(wmode == 1)                                                  //Outdoor Temperature
     {
         for(int l=0; l <= 25; l++){                                     //Fade up animation for numbers
@@ -924,12 +961,19 @@ void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B){
             printScreen(screenArray,inpix,inpix+88);
             delay(10);                                               //Adjust this delay to change animation duration
         }
-        connDelay(2500);
+        if(connDelay(2500)) return;
         if(isSensorDark()){
             for(int l=25; l >= 0; l--){                                     //Fade down animation
                 displayClock(clockpix, ((R*l)/25)+rclock, ((G*l)/25)+gclock, ((B*l)/25)+bclock, true);
                 displayTemp(TFahr,inpix,0,(G*l)/25,0,false);                     //Call function used to display numbers
-                printScreen(screenArray,clockpix,inpix+88);
+                if(fadeInternal){
+                    displayTemp(itemp,ITEMP_INPIX/*257*/,((R*l)/50)+rclock, gclock, ((B*l)/25)+bclock,true);
+                    displayHumid(ihumid,IHUMID_INPIX/*257*/,rclock, ((G*l)/100)+gclock, ((B*l)/25)+bclock,true);
+                    printScreen(screenArray,clockpix,IHUMID_INPIX+24);
+                }
+                else{
+                    printScreen(screenArray,clockpix,inpix+88);
+                }
                 delay(10);                                              //Adjust this delay to change animation duration
             }
             return;
@@ -955,12 +999,19 @@ void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B){
             printScreen(screenArray,inpix,inpix+88);
             delay(10);                                               //Adjust this delay to change animation duration
         }
-        connDelay(2500);
+        if(connDelay(2500)) return;
         if(isSensorDark()){
             for(int l=25; l >= 0; l--){                                     //Fade down animation
                 displayClock(clockpix, ((R*l)/25)+rclock, ((G*l)/25)+gclock, ((B*l)/25)+bclock, true);
                 displayTemp(itemp,inpix,(R*l)/50,0,(B*l)/25,false);                     //Call function used to display numbers
-                printScreen(screenArray,clockpix,inpix+88);
+                if(fadeInternal){
+                    displayTemp(itemp,ITEMP_INPIX/*257*/,((R*l)/50)+rclock, gclock, ((B*l)/25)+bclock,true);
+                    displayHumid(ihumid,IHUMID_INPIX/*257*/,rclock, ((G*l)/100)+gclock, ((B*l)/25)+bclock,true);
+                    printScreen(screenArray,clockpix,IHUMID_INPIX+24);
+                }
+                else{
+                    printScreen(screenArray,clockpix,inpix+88);
+                }
                 delay(10);                                              //Adjust this delay to change animation duration
             }
             return;
@@ -977,23 +1028,30 @@ void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B){
     if (wmode == 3)
     {
         for(int l=0; l <= 25; l++){
-            displayHumid(humidity,inpix,0,(G*l)/25,(B*l)/25);
+            displayHumid(humidity,inpix,0,(G*l)/25,(B*l)/25,false);
             printScreen(screenArray,inpix,inpix+88);
             delay(10);
         }
-        connDelay(2500);
+        if(connDelay(2500)) return;
         if(isSensorDark()){
             for(int l=25; l >= 0; l--){
                 displayClock(clockpix, ((R*l)/25)+rclock, ((G*l)/25)+gclock, ((B*l)/25)+bclock, true);
-                displayHumid(humidity,inpix,0,(G*l)/25,(B*l)/25);
-                printScreen(screenArray,clockpix,inpix+88);
+                displayHumid(humidity,inpix,0,(G*l)/25,(B*l)/25,false);
+                if(fadeInternal){
+                    displayTemp(itemp,ITEMP_INPIX/*257*/,((R*l)/50)+rclock, gclock, ((B*l)/25)+bclock,true);
+                    displayHumid(ihumid,IHUMID_INPIX/*257*/,rclock, ((G*l)/100)+gclock, ((B*l)/25)+bclock,true);
+                    printScreen(screenArray,clockpix,IHUMID_INPIX+24);
+                }
+                else{
+                    printScreen(screenArray,clockpix,inpix+88);
+                }
                 delay(10);
             }
             return;
         }
         else{
             for(int l=25; l >= 0; l--){
-                displayHumid(humidity,inpix,0,(G*l)/25,(B*l)/25);
+                displayHumid(humidity,inpix,0,(G*l)/25,(B*l)/25,false);
                 printScreen(screenArray,inpix,inpix+88);
                 delay(10);
             }
@@ -1021,7 +1079,14 @@ void weatherLoop(int inpix, int clockpix, uint8_t R, uint8_t G, uint8_t B){
                 displayClock(clockpix, ((R*l)/25)+rclock, ((G*l)/25)+gclock, ((B*l)/25)+bclock, true);
                 displayCondition(cid,inpix, ((R*l)/25)+rclock, ((G*l)/25)+gclock, ((B*l)/25)+bclock, false);
                 dimg(cid,160, ((R*l)/25)+rclock, ((G*l)/25)+gclock, ((B*l)/25)+bclock);
-                printScreen(screenArray,clockpix,inpix+88);
+                if(fadeInternal){
+                    displayTemp(itemp,ITEMP_INPIX/*257*/,((R*l)/50)+rclock, gclock, ((B*l)/25)+bclock,true);
+                    displayHumid(ihumid,IHUMID_INPIX/*257*/,rclock, ((G*l)/100)+gclock, ((B*l)/25)+bclock,true);
+                    printScreen(screenArray,clockpix,IHUMID_INPIX+24);
+                }
+                else{
+                    printScreen(screenArray,clockpix,inpix+88);
+                }
                 delay(10);
             }
             return;
@@ -1041,10 +1106,14 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
     #define numMenuItems 6
     bool sett = true;
     int smode = 1;
+    int currentDarkColor = EEPROM.read(5);
+    int sclock = EEPROM.read(6) + 1;
+    int getWeather = EEPROM.read(2);
+    int trueToneEEPROM = EEPROM.read(7);
     fillStrip(inpix,inpix+255,0,0,0,true);
     strDisp("Settings",inpix,R,G,B,false);
     printScreen(screenArray,inpix,inpix+255);
-    while(digitalRead(enbtn) == HIGH) delay(5);
+    while(eTrig) delay(5);
     fillStrip(inpix,inpix+255,0,0,0,true);
     while(sett == true) 
     {
@@ -1066,9 +1135,9 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 break;
             case 6:
                 strDisp("Exit", inpix, R, G, B, false);
-                if(digitalRead(enbtn) == HIGH){
+                if(eTrig){
                     sett = false;
-                    while(digitalRead(enbtn) == HIGH) delay(5);
+                    while(eTrig) delay(5);
                     fillStrip(inpix,inpix+255,0,0,0,true);
                 }
                 break;
@@ -1085,11 +1154,11 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 strDisp("Mini clk", inpix, R, G, B, false);
                 break;*/                
         }
-        if(digitalRead(enbtn) == HIGH){
+        if(eTrig){
             bool submenu = true;
             int submode = 1;
             int tzoff = EEPROM.read(1);
-            while(digitalRead(enbtn) == HIGH) delay(5);
+            while(eTrig) delay(5);
             fillStrip(inpix,inpix+255,0,0,0,true);
             while(submenu){
                 switch (smode){
@@ -1097,35 +1166,69 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         switch(submode){
                             case 1:
                                 strDisp("sig str", inpix, R, G, B, false);
-                                if(digitalRead(enbtn) == HIGH){
+                                if(eTrig){
                                     #if PLATFORM_ID == PLATFORM_ARGON
                                         WiFiSignal sig = WiFi.RSSI();
                                         uint8_t strength = uint8_t(sig.getStrength());
                                     #elif PLATFORM_ID == PLATFORM_BORON
                                         CellularSignal sig = Cellular.RSSI();
-                                        uint8_t strength = sig.getStrength();     
+                                        uint8_t strength = sig.getStrength(); 
+                                    #else
+                                        uint8_t strength = 0;
                                     #endif
+
                                     fillStrip(inpix,inpix+255,0,0,0,true);
                                     displayNumber(strength/100,inpix,R,G,B,true);
                                     displayNumber((strength/10)%10,inpix+48,R,G,B,true);
                                     displayNumber(strength%10,inpix+96,R,G,B,true);
                                     printScreen(screenArray,inpix,inpix+255);
-                                    while(digitalRead(enbtn) == HIGH) delay(5);
-                                    while(digitalRead(enbtn) == LOW) delay(5);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig) delay(5);
                                     fillStrip(inpix,inpix+255,0,0,0,true);
-                                    while(digitalRead(enbtn) == HIGH) delay(5);
+                                    while(eTrig) delay(5);
                                 }
                                 break;
                             case 2:
-                                strDisp("IP",inpix, R, G, B, false);
+                                strDisp("Net name",inpix, R, G, B, false);
+                                if(eTrig){
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    #if PLATFORM_ID == PLATFORM_ARGON
+                                        strDisp(WiFi.SSID(),inpix,R,G,B,true);
+                                    #elif PLATFORM_ID == PLATFORM_BORON
+                                        strDisp(Cellular.localIP().toString().c_str(),inpix,R,G,B,true);    
+                                    #endif
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig) delay(5);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
                             case 3:
-                                strDisp("Net name", inpix, R, G, B, false);
+                                strDisp("IP", inpix, R, G, B, false);
+                                if(eTrig){
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    #if PLATFORM_ID == PLATFORM_ARGON
+                                        strDisp(WiFi.localIP().toString().c_str(),inpix,R,G,B,true);
+                                    #elif PLATFORM_ID == PLATFORM_BORON
+                                        strDisp(Cellular.localIP().toString().c_str(),inpix,R,G,B,true);    
+                                    #endif
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig) delay(5);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
-                            case 4:
+                            default:
                                 strDisp("Exit", inpix, R, G, B, false);
-                                if(digitalRead(enbtn) == HIGH) submenu = false;
-                                break;
+                                if(eTrig){
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                    submenu = false;
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    break;
+                                }
                         }
                         if(menuButtonUpdate(&submode,4)) fillStrip(inpix,inpix+255,0,0,0,true);
                         break;
@@ -1133,17 +1236,77 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         switch(submode){
                             case 1:
                                 strDisp("Tru-tone", inpix, R, G, B, false);
+                                if(eTrig){               
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    if(trueToneEEPROM == 1){
+                                        strDisp("YES",inpix,0,G,0,false);
+                                    }
+                                    else{
+                                        strDisp("NO",inpix,R,0,0,false);
+                                    }
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig){
+                                        if(menuButtonUpdate(&trueToneEEPROM,2)){
+                                            fillStrip(inpix,inpix+255,0,0,0,true);
+                                            if(trueToneEEPROM == 1){
+                                                strDisp("YES",inpix,0,G,0,false);
+                                            }
+                                            else{
+                                                strDisp("NO",inpix,R,0,0,false);
+                                            }
+                                            printScreen(screenArray,inpix,inpix+255);
+                                        }
+                                        delay(5);
+                                    }
+                                    EEPROM.write(7,(uint8_t)trueToneEEPROM + 1);
+                                    trueTone == (trueToneEEPROM == 1);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
                             case 2:
                                 strDisp("Get wthr",inpix, R, G, B, false);
+                                if(eTrig){               
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    if(getWeather == 1){
+                                        strDisp("YES",inpix,0,G,0,false);
+                                    }
+                                    else{
+                                        strDisp("NO",inpix,R,0,0,false);
+                                    }
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig){
+                                        if(menuButtonUpdate(&getWeather,2)){
+                                            fillStrip(inpix,inpix+255,0,0,0,true);
+                                            if(getWeather == 1){
+                                                strDisp("YES",inpix,0,G,0,false);
+                                            }
+                                            else{
+                                                strDisp("NO",inpix,R,0,0,false);
+                                            }
+                                            printScreen(screenArray,inpix,inpix+255);
+                                        }
+                                        delay(5);
+                                    }
+                                    EEPROM.write(2,getWeather);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
                             case 3:
                                 strDisp("Get temp", inpix, R, G, B, false);
                                 break;
-                            case 4:
+                            default:
                                 strDisp("Exit", inpix, R, G, B, false);
-                                if(digitalRead(enbtn) == HIGH) submenu = false;
-                                break;
+                                if(eTrig){
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                    submenu = false;
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    break;
+                                }
                         }
                         if(menuButtonUpdate(&submode,4)) fillStrip(inpix,inpix+255,0,0,0,true);
                         break;
@@ -1151,17 +1314,82 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         switch(submode){
                             case 1:
                                 strDisp("Mini clk", inpix, R, G, B, false);
+                                if(eTrig){               
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    if(sclock == 2){
+                                        strDisp("YES",inpix,0,G,0,false);
+                                    }
+                                    else{
+                                        strDisp("NO",inpix,R,0,0,false);
+                                    }
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig){
+                                        if(menuButtonUpdate(&sclock,2)){
+                                            fillStrip(inpix,inpix+255,0,0,0,true);
+                                            if(sclock == 2){
+                                                strDisp("YES",inpix,0,G,0,false);
+                                            }
+                                            else{
+                                                strDisp("NO",inpix,R,0,0,false);
+                                            }
+                                            printScreen(screenArray,inpix,inpix+255);
+                                        }
+                                        delay(5);
+                                    }
+                                    EEPROM.write(6,(uint8_t)sclock + 1);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
                             case 2:
-                                strDisp("Dark clr",inpix, R, G, B, false);
+                                strDisp("Dark clr",inpix, R, G, B, false);      //Dark mode color EEPROM settin
+                                if(eTrig){               
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    if(currentDarkColor == 2){
+                                        strDisp("GREEN",inpix,0,G,0,false);
+                                    }
+                                    else if(currentDarkColor == 3){
+                                        strDisp("BLUE",inpix,0,0,B,false);
+                                    }
+                                    else{
+                                        strDisp("RED",inpix,R,0,0,false);
+                                    }
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig){
+                                        if(menuButtonUpdate(&currentDarkColor,3)){
+                                            fillStrip(inpix,inpix+255,0,0,0,true);
+                                            if(currentDarkColor == 2){
+                                                strDisp("GREEN",inpix,0,G,0,false);
+                                            }
+                                            else if(currentDarkColor == 3){
+                                                strDisp("BLUE",inpix,0,0,B,false);
+                                            }
+                                            else{
+                                                strDisp("RED",inpix,R,0,0,false);
+                                            }
+                                            printScreen(screenArray,inpix,inpix+255);
+                                        }
+                                        delay(5);
+                                    }
+                                    EEPROM.write(5,(uint8_t)currentDarkColor);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
                             case 3:
                                 strDisp("Disp temp", inpix, R, G, B, false);
                                 break;
-                            case 4:
+                            default:
                                 strDisp("Exit", inpix, R, G, B, false);
-                                if(digitalRead(enbtn) == HIGH) submenu = false;
-                                break;
+                                if(eTrig){
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                    submenu = false;
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    break;
+                                }
                         }
                         if(menuButtonUpdate(&submode,4)) fillStrip(inpix,inpix+255,0,0,0,true);
                         break;
@@ -1169,23 +1397,41 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         switch(submode){
                             case 1:
                                 strDisp("Sys-vsn", inpix, R, G, B, false);
+                                if(eTrig){               
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    strDisp(System.version().c_str(),inpix,R,G,B,false);
+                                    printScreen(screenArray,inpix,inpix+255);
+                                    while(eTrig) delay(5);
+                                    while(!eTrig) delay(5);
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                }
                                 break;
                             case 2:
                                 strDisp("Firm-vsn",inpix, R, G, B, false);
                                 break;
                             case 3:
                                 strDisp("Reset", inpix, R, G, B, false);
+                                if(eTrig){ 
+                                    EEPROM.write(0,0);  //Erase the key code in the EEPROM which will trigger refresh of EEPROM
+                                    System.reset();     //Reset system so the EEPROM is reset on startup
+                                }
                                 break;
-                            case 4:
+                            default:
                                 strDisp("Exit", inpix, R, G, B, false);
-                                if(digitalRead(enbtn) == HIGH) submenu = false;
-                                break;
+                                if(eTrig){
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    while(eTrig) delay(5);
+                                    submenu = false;
+                                    fillStrip(inpix,inpix+255,0,0,0,true);
+                                    break;
+                                }
                         }
                         if(menuButtonUpdate(&submode,4)) fillStrip(inpix,inpix+255,0,0,0,true);
                         break;
                     case 5:
-                        while(digitalRead(enbtn)) delay(5);
-                        while(!digitalRead(enbtn)){
+                        while(eTrig) delay(5);
+                        while(!eTrig){
                             displayClock(0, 0, gclock, 0, true);
                             printScreen(screenArray,0,255);
                             if(menuButtonUpdate(&tzoff,23)){
@@ -1198,14 +1444,14 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                             delay(5);
                         }
                         EEPROM.write(1, tzoff);
-                        while(digitalRead(enbtn)) delay(5);
+                        while(eTrig) delay(5);
                         submenu = false;
                         break;
                     case 6:
                         strDisp("Exit", inpix, R, G, B, false);
-                        if(digitalRead(enbtn) == HIGH){
+                        if(eTrig){
                             submenu = false;
-                            while(digitalRead(enbtn) == HIGH) delay(5);
+                            while(eTrig) delay(5);
                         }
                         break;
                 }
@@ -1215,10 +1461,10 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 fillStrip(inpix,inpix+255,0,0,0,true);
                 strDisp(WiFi.SSID(), 0, rclock/2, gclock, bclock/2);
                 printScreen(screenArray,inpix,inpix+255);
-                while(digitalRead(enbtn) == HIGH) delay(50);
-                while(digitalRead(enbtn) == LOW)  delay(50);
+                while(eTrig) delay(50);
+                while(!eTrig)  delay(50);
                 fillStrip(inpix,inpix+255,0,0,0,true);
-                while(digitalRead(enbtn) == HIGH) delay(5);
+                while(eTrig) delay(5);
             }
             else if(dispm == 2){
                 WiFiSignal sig = WiFi.RSSI();
@@ -1228,10 +1474,10 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 displayNumber((strength/10)%10,inpix+48,R,G,B);
                 displayNumber(strength%10,inpix+96,R,G,B);
                 printScreen(screenArray,inpix,inpix+255);
-                while(digitalRead(enbtn) == HIGH) delay(5);
-                while(digitalRead(enbtn) == LOW) delay(5);
+                while(eTrig) delay(5);
+                while(!eTrig) delay(5);
                 fillStrip(inpix,inpix+255,0,0,0,true);
-                while(digitalRead(enbtn) == HIGH) delay(5);
+                while(eTrig) delay(5);
             }
             else if(dispm == 3){
                 fillStrip(inpix,inpix+255,0,0,0,true);
@@ -1245,12 +1491,12 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 displayNumber(abs(tzoff)/10,inpix+40,R, G, B);
                 displayNumber(abs(tzoff%10),inpix+88, R, G, B);
                 printScreen(screenArray,inpix,inpix+255);
-                while(digitalRead(enbtn) == HIGH) delay(5);
-                while(digitalRead(enbtn) == LOW)
+                while(eTrig) delay(5);
+                while(!eTrig)
                 {
-                    if(digitalRead(dnbtn) == HIGH && tzoff < 12){
+                    if(lTrig && tzoff < 12){
                         tzoff++;
-                        while(digitalRead(dnbtn) == HIGH) delay(5);
+                        while(lTrig) delay(5);
                     }
                     if(digitalRead(upbtn) == HIGH && tzoff > -12){
                         tzoff--;
@@ -1272,24 +1518,24 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 EEPROM.write(1, 12-tzoff);
                 Time.zone(12-EEPROM.read(1));
                 Particle.syncTime();
-                while(digitalRead(enbtn) == HIGH) delay(5);
+                while(eTrig) delay(5);
             }
             else if(dispm == 4){
                 fillStrip(inpix,inpix+255,0,0,0,true);
                 strDisp(System.version(),inpix,R,G,B);
                 printScreen(screenArray,inpix,inpix+255);
-                while(digitalRead(enbtn) == HIGH) delay(5);
-                while(digitalRead(enbtn) == LOW) delay(5);
+                while(eTrig) delay(5);
+                while(!eTrig) delay(5);
                 fillStrip(inpix,inpix+255,0,0,0,true);
-                while(digitalRead(enbtn) == HIGH) delay(5);
+                while(eTrig) delay(5);
             }
             else if(dispm == 5){
                 fillStrip(inpix,inpix+255,0,0,0,true);
                 strDisp("YES",inpix,0,G,0);
                 printScreen(screenArray,inpix,inpix+255);
                 EEPROM.write(2,1);
-                while(digitalRead(enbtn) == HIGH) delay(5);
-                while(digitalRead(enbtn) == LOW)
+                while(eTrig) delay(5);
+                while(!eTrig)
                 {
                     if(digitalRead(upbtn) == HIGH){
                         fillStrip(inpix,inpix+255,0,0,0,true);
@@ -1297,7 +1543,7 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         printScreen(screenArray,inpix,inpix+255);
                         EEPROM.write(2,1);
                     }
-                    else if(digitalRead(dnbtn) == HIGH){
+                    else if(lTrig){
                         fillStrip(inpix,inpix+255,0,0,0,true);
                         strDisp("NO",inpix,R,0,0);
                         printScreen(screenArray,inpix,inpix+255);
@@ -1306,15 +1552,15 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                     delay(5);
                 }
                 fillStrip(inpix,inpix+255,0,0,0,true);
-                while(digitalRead(enbtn) == HIGH) delay(5);
+                while(eTrig) delay(5);
             }
             else if(dispm == 6){
                 fillStrip(inpix,inpix+255,0,0,0,true);
                 strDisp("YES",inpix,0,G,0);
                 printScreen(screenArray,inpix,inpix+255);
                 EEPROM.write(3,1);
-                while(digitalRead(enbtn) == HIGH) delay(5);
-                while(digitalRead(enbtn) == LOW)
+                while(eTrig) delay(5);
+                while(!eTrig)
                 {
                     if(digitalRead(upbtn) == HIGH){
                         fillStrip(inpix,inpix+255,0,0,0,true);
@@ -1322,7 +1568,7 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                         printScreen(screenArray,inpix,inpix+255);
                         EEPROM.write(3,1);
                     }
-                    else if(digitalRead(dnbtn) == HIGH){
+                    else if(lTrig){
                         fillStrip(inpix,inpix+255,0,0,0,true);
                         strDisp("NO",inpix,R,0,0);
                         printScreen(screenArray,inpix,inpix+255);
@@ -1331,24 +1577,24 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                     delay(5);
                 }
                 fillStrip(inpix,inpix+255,0,0,0,true);
-                while(digitalRead(enbtn) == HIGH) delay(5);
+                while(eTrig) delay(5);
             }
             else if(dispm == 7){
                 strip.clear();
                 strdisp("YES",0,0,gclock,0);
                 EEPROM.write(4,1);
-                while(digitalRead(enbtn) == HIGH)
+                while(eTrig)
                 {
                     delay(5);
                 }
-                while(digitalRead(enbtn) == LOW)
+                while(!eTrig)
                 {
                     if(digitalRead(upbtn) == HIGH){
                         strip.clear();
                         strdisp("YES",0,0,gclock,0);
                         EEPROM.write(4,1);
                     }
-                    else if(digitalRead(dnbtn) == HIGH){
+                    else if(lTrig){
                         strip.clear();
                         strdisp("NO",0,rclock,0,0);
                         EEPROM.write(4,0);
@@ -1356,7 +1602,7 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                     delay(5);
                 }
                 strip.clear();
-                while(digitalRead(enbtn) == HIGH)
+                while(eTrig)
                 {
                     delay(5);
                 }
@@ -1367,18 +1613,18 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 color = 1;
                 strdisp("RED",0,rclock,0,0);
                 EEPROM.write(5,1);
-                while(digitalRead(enbtn) == HIGH)
+                while(eTrig)
                 {
                     delay(5);
                 }
-                while(digitalRead(enbtn) == LOW)
+                while(!eTrig)
                 {
                     if(digitalRead(upbtn) == HIGH && digitalRead(D2) == LOW){
                         strip.clear();
                         strdisp("RED",0,rclock,0,0);
                         EEPROM.write(5,1);
                     }
-                    else if(digitalRead(dnbtn) == HIGH && digitalRead(D0) == LOW){
+                    else if(!lTrig && digitalRead(D0) == LOW){
                         strip.clear();
                         strdisp("GREEN",0,0,gclock,0);
                         EEPROM.write(5,2);
@@ -1392,7 +1638,7 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                     delay(5);
                 }
                 strip.clear();
-                while(digitalRead(enbtn) == HIGH)
+                while(eTrig)
                 {
                     delay(5);
                 }
@@ -1401,11 +1647,11 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                 strip.clear();
                 strdisp("YES",0,0,gclock,0);
                 EEPROM.write(6,1);
-                while(digitalRead(enbtn) == HIGH)
+                while(eTrig)
                 {
                     delay(5);
                 }
-                while(digitalRead(enbtn) == LOW)
+                while(!eTrig)
                 {
                     if(digitalRead(upbtn) == HIGH){
                         strip.clear();
@@ -1420,19 +1666,21 @@ void settings(int inpix, uint8_t R, uint8_t G, uint8_t B){                      
                     delay(5);
                 }
                 strip.clear();
-                while(digitalRead(enbtn) == HIGH)
+                while(eTrig)
                 {
                     delay(5);
                 }
             }*/
+            Serial.println("Exited submenu");
         }
         if(menuButtonUpdate(&smode,numMenuItems)) fillStrip(inpix,inpix+255,0,0,0,true);
         printScreen(screenArray,inpix,inpix+255);
         delay(50);
     }
+    Serial.println("Exited Menu");
 }
 bool menuButtonUpdate(int *modeSelect, int maxItems){
-    if(digitalRead(upbtn) == LOW && digitalRead(enbtn) == LOW && digitalRead(dnbtn) == HIGH)
+    if(rTrig && !eTrig && !lTrig)
     {
         if(*modeSelect < maxItems){
             *modeSelect = *modeSelect + 1;
@@ -1440,10 +1688,10 @@ bool menuButtonUpdate(int *modeSelect, int maxItems){
         else{
             *modeSelect = 1;
         }
-        while(digitalRead(dnbtn) == HIGH && digitalRead(upbtn) == LOW) delay(5);
+        while(!lTrig && rTrig) delay(5);
         return true;
     }
-    if(digitalRead(upbtn) == HIGH && digitalRead(enbtn) == LOW && digitalRead(dnbtn) == LOW)
+    if(!rTrig && !eTrig && lTrig)
     {
         if(*modeSelect > 1){
             *modeSelect = *modeSelect - 1;
@@ -1451,7 +1699,7 @@ bool menuButtonUpdate(int *modeSelect, int maxItems){
         else{
             *modeSelect = maxItems;
         }
-        while(digitalRead(upbtn) == HIGH && digitalRead(dnbtn) == LOW) delay(5);
+        while(!rTrig && lTrig) delay(5);
         return true;
     }
     return false;
@@ -1519,14 +1767,14 @@ void colorModeProcess(){
                 double tempG;
                 tempB = (float)analogRead(A4)/((float)5428)+0.3;
                 tempG = (float)analogRead(A4)/((float)10000)+0.65;
-                rclock = analogRead(A4)/18;//*(1-(analogRead(A4)/9500));
-                gclock = (analogRead(A4)/18)*tempG;
-                bclock = (analogRead(A4)/18)*tempB;
+                rclock = photo;//*(1-(analogRead(A4)/9500));
+                gclock = photo*tempG;
+                bclock = photo*tempB;
             }
             else{
-                rclock = analogRead(A4)/18;
-                gclock = (analogRead(A4)/18)*0.9;
-                bclock = (analogRead(A4)/18)*0.8;
+                rclock = photo;
+                gclock = photo*0.9;
+                bclock = photo*0.8;
             }
             bound = dnbound;
             //RGB.control(false);
@@ -1545,6 +1793,10 @@ void loop(){
 //////////////MODE 1//////////////////              Clock with cycling weather conditions
 //////////////////////////////////////
     
+    //if(!BLE.advertising()){
+    //    BLE.advertise(&advData);                        //Start advertising the characteristics
+    //}
+
     if(dmode == 1){                                                     
 
         displayClock(0, rclock, gclock, bclock, true);                          //Manually Update Temperature every full cycle
@@ -1559,27 +1811,40 @@ void loop(){
             ///////WEATHER DISPLAY MODES//////////
             if(EEPROM.read(2) == 1)                                             //Check if setting is enabled for displaying weather elements
             {
-                weatherLoop(160,0,rclock,gclock,bclock);
+                weatherLoop(160,0,rclock,gclock,bclock,displayInteral);
             }
-            if(digitalRead(upbtn) == LOW && digitalRead(enbtn) == HIGH && digitalRead(dnbtn) == LOW){
+            if(displayInteral){
+                displayTemp(itemp,ITEMP_INPIX/*257*/,rclock >> 2, 0, bclock >> 1,true);
+                displayHumid(ihumid,IHUMID_INPIX/*257*/,0, gclock >> 2, bclock >> 1,true);
+                printScreen(screenArray,257,369);
+            }
+            if(!rTrig && eTrig && !lTrig){
                 settings(256,rclock,gclock,bclock);
+                Serial.println("Exited function");
+                dmode = 1;  //Some weird bug
             }
         }
 
         ///////IF SENSOR IS DARK//////////
         else
         {
-            //if(EEPROM.read(2) == 1){
+            if(EEPROM.read(2) == 1){
                 displayCondition(cid,160, rclock, gclock, bclock, true);
                 dimg(cid,160, rclock, gclock, bclock);
-                displayTemp(TFahr,257/*169+256*/,rclock, gclock, bclock,true);
+                displayTemp(TFahr,441/*257*/,rclock, gclock, bclock,true);
+                if(displayInteral){
+                    displayTemp(itemp,ITEMP_INPIX/*257*/,rclock, gclock, bclock,true);
+                    displayHumid(ihumid,IHUMID_INPIX/*257*/,rclock, gclock, bclock,true);
+                }
                 //digitalWrite(D7,HIGH);
                 printScreen(screenArray,160,255);
-            //}
+            }
             delay(1000);
             //digitalWrite(D7,LOW);
         }
+        Serial.printlnf("Loop Iteration %d",millis());
     }
+    Serial.printlnf("Loop Iteration 2 %d",millis());
     delay(100);
 }
 void fillStrip(int start, int end, uint8_t R, uint8_t G, uint8_t B, bool apply){
@@ -1640,6 +1905,49 @@ void weatherHandler(const char *event, const char *data) {
         TFahr = (int)tempF;
     }
 }
+
+void lButtonInt(){      //Enter button interrupt, sets flag to indicate right button was pressed
+    lTrig = digitalRead(dnbtn);
+}
+void rButtonInt(){      //Enter button interrupt, sets flag to indicate right button was pressed
+    rTrig = digitalRead(upbtn);
+}
+void eButtonInt(){      //Enter button interrupt, sets flag to indicate right button was pressed
+    eTrig = digitalRead(enbtn);
+}
+
+void controlDataReceived(const uint8_t* data, size_t len, const BlePeerDevice& peer, void* context){
+    if(len == 0) return;
+    if(data[0] == 'r'){
+        rTrig = true;
+    }
+    else if(data[0] == 'e'){
+        eTrig = true;
+    }
+    else if(data[0] == 'l'){
+        lTrig = true;
+    }
+    else if(data[0] == 'd'){
+        if(len > 2){
+            itemp = data[1];
+            ihumid = data[2];
+            displayInteral = true;
+        }
+        for(uint8_t ii = 1; ii < len; ii++){
+            Serial.printf("%d ",data[ii]);
+        }
+        Serial.println();
+    }
+    bleButtonTimer.startFromISR();
+}
+
+void bleClickInt(){
+    rTrig = false;
+    eTrig = false;
+    lTrig = false;
+    bleButtonTimer.stopFromISR();
+}
+
 void weatherHandlerHL(const char *event, const char *HLdata) {
   // Handle the integration response
     int xyz;
@@ -1754,11 +2062,3 @@ void stockHandler(const char *event, const char *data){
         strcpy(dowVal,tempdat);
     }
 }
-
- 
-
-
-
-
-
-
